@@ -101,6 +101,8 @@ python run_agent.py show <session_id>
 - `CODING_AGENT_QWEN_MAX_RETRIES`: 重试次数，默认 `2`
 - `CODING_AGENT_QWEN_RETRY_BACKOFF_SECONDS`: 指数退避初始秒数，默认 `1`
 
+这是我第一次上传代码，我想这是一个值得纪念的时刻，看看我们能在ai时代都留下些什么
+
 说明：
 
 - 未设置 `QWEN_API_KEY` 时，`clarify / plan / proposal` 会自动回退到离线逻辑
