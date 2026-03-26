@@ -1,7 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 import json
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .models import (
     ProposalAssessment,
     ProposalCandidate,
     ProposalEditCandidate,
+    ResearchSource,
     RetrievedFile,
     Session,
     Step,
@@ -23,14 +25,17 @@ from .models import (
 )
 from .prompts import (
     CLARIFY_PROMPT,
+    EDIT_PROMPT,
     PLAN_PROMPT,
     PROPOSAL_PROMPT,
     SYSTEM_PROMPT,
     build_clarify_prompt,
+    build_edit_prompt,
     build_plan_prompt,
     build_proposal_prompt,
 )
 from .render import TerminalRenderer
+from .research import WebResearchClient
 from .repo_ops import RepoOps
 from .repo_summary import RepoContextBuilder
 from .retrieval import RepoRetriever
@@ -46,11 +51,19 @@ from .workflow import (
     EDIT_PROPOSAL_TOOL,
     PRESET_EDIT_TOOL,
     READ_REPO_TOOL,
+    RESEARCH_TOOL,
     REVIEW_TOOL,
     TEST_COMMAND_TOOL,
     ToolExecutor,
     ToolRequest,
 )
+
+@dataclass(slots=True)
+class GeneratedFileEdit:
+    path: str
+    change_type: str
+    summary: str
+    content: str | None = None
 
 
 class Runner:
@@ -64,6 +77,7 @@ class Runner:
         retriever: RepoRetriever | None = None,
         context_builder: RepoContextBuilder | None = None,
         tool_executor: ToolExecutor | None = None,
+        research_client: WebResearchClient | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -73,6 +87,7 @@ class Runner:
         self.retriever = retriever or RepoRetriever()
         self.context_builder = context_builder or RepoContextBuilder()
         self.tool_executor = tool_executor or ToolExecutor()
+        self.research_client = research_client or WebResearchClient(config)
 
     def run(
         self,
@@ -80,6 +95,9 @@ class Runner:
         repo_path: str | None = None,
         max_fix: int = 1,
         session_name: str | None = None,
+        session_id: str | None = None,
+        enable_web_research: bool = False,
+        research_query: str | None = None,
     ) -> Session:
         repo_root = Path(repo_path).resolve() if repo_path else self.config.default_repo_dir
         repo_ops = RepoOps(repo_root)
@@ -88,26 +106,32 @@ class Runner:
         max_fix = max(0, max_fix)
 
         created_at = utc_now()
+        constraints = [
+            "Python repository only",
+            "Single agent",
+            "One-shot CLI flow",
+            f"Auto-fix limit: {max_fix}",
+        ]
+        normalized_research_query = self._normalize_text(research_query or task_text) if enable_web_research else ""
+        if enable_web_research:
+            constraints.append("Optional external research enabled")
         request = TaskRequest(
             request_id=new_id("req"),
             user_text=task_text,
             repo_path=str(repo_root),
             created_at=created_at,
-            constraints=[
-                "Python repository only",
-                "Single agent",
-                "One-shot CLI flow",
-                f"Auto-fix limit: {max_fix}",
-            ],
+            constraints=constraints,
         )
         session = Session(
-            session_id=new_id("sess"),
+            session_id=session_id or new_id("sess"),
             session_name=session_name,
             request=request,
             status="running",
             created_at=created_at,
             started_at=created_at,
             task_handler=matched_handler.name if matched_handler else None,
+            research_enabled=enable_web_research,
+            research_query=normalized_research_query or None,
         )
         retrieval_limit = 2 if matched_handler is not None else 3
         session.retrieved_files = self.retriever.build(
@@ -140,6 +164,23 @@ class Runner:
                     ]
                 },
             )
+
+            if session.research_enabled and session.research_query:
+                session.research_summary = self._run_step(
+                    session,
+                    "research",
+                    session.research_query,
+                    lambda: self._execute_tool(
+                        session,
+                        step_type="research",
+                        tool_name=RESEARCH_TOOL,
+                        purpose="gather optional external sources that may inform the implementation",
+                        input_summary=session.research_query,
+                        handler=matched_handler,
+                        action=lambda: self._research_tool(session),
+                    ),
+                )
+                self.store.save_summary(session)
 
             session.clarify_summary = self._run_step(
                 session,
@@ -186,7 +227,7 @@ class Runner:
                     tool_name=EDIT_PROPOSAL_TOOL,
                     purpose="generate a proposal-only edit summary inside the allowed scope",
                     input_summary=session.read_summary,
-                    requested_targets=self._planned_targets(matched_handler),
+                    requested_targets=self._planned_targets(session, matched_handler),
                     handler=matched_handler,
                     action=lambda: self._proposal_tool(session, task_text, repo_ops, request.constraints, matched_handler),
                 ),
@@ -202,7 +243,7 @@ class Runner:
                     tool_name=PRESET_EDIT_TOOL,
                     purpose="apply the matched preset change set",
                     input_summary=session.proposal_summary,
-                    requested_targets=self._planned_targets(matched_handler),
+                    requested_targets=self._planned_targets(session, matched_handler),
                     handler=matched_handler,
                     action=lambda: self._edit_repo_tool(session, repo_ops, matched_handler),
                 ),
@@ -222,7 +263,7 @@ class Runner:
                         tool_name=PRESET_EDIT_TOOL,
                         purpose="apply one scoped repair pass",
                         input_summary=test_summary,
-                        requested_targets=self._planned_targets(matched_handler),
+                        requested_targets=self._planned_targets(session, matched_handler),
                         handler=matched_handler,
                         action=lambda: self._fix_repo_tool(session, repo_ops, matched_handler, test_summary),
                     ),
@@ -426,6 +467,7 @@ class Runner:
             file_summaries,
             file_snippets,
             validation_command,
+            external_research=self._prompt_research_sources(session.research_sources),
         )
         validator = handler.validate_clarify_response if handler else None
         artifact = self._complete_structured_or_fallback(
@@ -464,6 +506,7 @@ class Runner:
             file_summaries,
             file_snippets,
             validation_command,
+            external_research=self._prompt_research_sources(session.research_sources),
         )
         validator = handler.validate_plan_response if handler else None
         artifact = self._complete_structured_or_fallback(
@@ -489,7 +532,7 @@ class Runner:
         retrieved_summary = self._prompt_retrieved_files(session.retrieved_files)
         file_summaries = self._prompt_context_summaries(session.context_summaries)
         file_snippets = self._prompt_file_snippets(repo_ops, session.retrieved_files)
-        allowed_edit_scope = list(self._planned_targets(handler))
+        allowed_edit_scope = list(self._planned_targets(session, handler))
         validation_command = handler.validation_command if handler else DEFAULT_VALIDATION_COMMAND
         prompt = build_proposal_prompt(
             task_text,
@@ -502,12 +545,13 @@ class Runner:
             file_snippets,
             validation_command,
             allowed_edit_scope,
+            external_research=self._prompt_research_sources(session.research_sources),
         )
         validator = handler.validate_proposal_response if handler else None
         candidate = self._complete_structured_or_fallback(
             prompt,
             f"{SYSTEM_PROMPT}\n{PROPOSAL_PROMPT}",
-            fallback=self._offline_proposal_candidate(handler, validation_command),
+            fallback=self._offline_proposal_candidate(session, handler, validation_command),
             parser=lambda response: self._parse_proposal_candidate(response, allowed_edit_scope, validation_command),
             validator=validator,
             session=session,
@@ -657,7 +701,7 @@ class Runner:
         handler: TaskHandler | None,
         validation_command: str,
     ) -> ClarifyArtifact:
-        relevant_files = list(handler.required_files) if handler else [item.path for item in session.retrieved_files[:2]]
+        relevant_files = list(handler.required_files) if handler else list(self._generic_target_paths(session)[:3])
         return ClarifyArtifact(
             implementation_target=handler.offline_clarify if handler else self._offline_clarify(),
             relevant_files=relevant_files,
@@ -670,7 +714,7 @@ class Runner:
         handler: TaskHandler | None,
         validation_command: str,
     ) -> PlanArtifact:
-        target_files = list(handler.required_files) if handler else [item.path for item in session.retrieved_files[:2]]
+        target_files = list(handler.required_files) if handler else list(self._generic_target_paths(session)[:3])
         steps = list(handler.offline_plan_steps) if handler else [
             "Inspect the retrieved source and test files.",
             "Prepare focused edits inside the bounded repository scope.",
@@ -681,13 +725,27 @@ class Runner:
 
     def _offline_proposal_candidate(
         self,
+        session: Session,
         handler: TaskHandler | None,
         validation_command: str,
     ) -> ProposalCandidate:
         if handler is None:
+            generic_targets = list(self._generic_target_paths(session))
+            edits = [
+                ProposalEditCandidate(
+                    path=path,
+                    change_type="update",
+                    target_symbols=[],
+                    intent="update this bounded Python file to satisfy the current task while preserving unrelated behavior",
+                )
+                for path in generic_targets
+            ]
+            summary_text = self._offline_proposal()
+            if generic_targets:
+                summary_text = f"Prepare bounded edits for {', '.join(generic_targets)}."
             return ProposalCandidate(
-                summary_text=self._offline_proposal(),
-                edits=[],
+                summary_text=summary_text,
+                edits=edits,
                 validation_command=validation_command,
             )
         edits = [
@@ -703,6 +761,83 @@ class Runner:
             summary_text=handler.offline_proposal,
             edits=edits,
             validation_command=validation_command,
+        )
+
+    def _research_tool(self, session: Session) -> tuple[str, str]:
+        query = self._normalize_text(session.research_query or session.request.user_text)
+        if not query:
+            summary = "No external research query was provided."
+            session.research_summary = summary
+            self.store.save_summary(session)
+            return summary, summary
+
+        try:
+            sources = self.research_client.search(query, max_results=self.config.web_research_max_results)
+        except RuntimeError as exc:
+            session.research_sources = []
+            summary = f"External research unavailable: {exc}"
+            session.research_summary = summary
+            self.store.save_summary(session)
+            return summary, summary
+
+        session.research_sources = list(sources)
+        summary = self._research_summary_text(query, session.research_sources)
+        session.research_summary = summary
+        self.store.save_summary(session)
+        return summary, summary
+
+    def _research_summary_text(self, query: str, sources: list[ResearchSource]) -> str:
+        if not sources:
+            return f"External research returned no sources for query '{query}'."
+        source_titles = ", ".join(source.title for source in sources[:3])
+        return f"External research captured {len(sources)} source(s) for '{query}': {source_titles}."
+
+    def _prompt_research_sources(self, research_sources: list[ResearchSource]) -> list[tuple[str, str, str]]:
+        prompt_items: list[tuple[str, str, str]] = []
+        for source in research_sources[:4]:
+            prompt_items.append((source.title, source.url, self._truncate_for_prompt(source.snippet, max_lines=3, max_chars=280)))
+        return prompt_items
+
+    def _generic_target_paths(self, session: Session) -> tuple[str, ...]:
+        ordered_paths: list[str] = []
+        for candidate_path in (
+            *(session.plan_artifact.target_files if session.plan_artifact else []),
+            *(session.clarify_artifact.relevant_files if session.clarify_artifact else []),
+            *(item.path for item in session.retrieved_files[:3]),
+        ):
+            normalized = self._normalize_text(candidate_path)
+            if not normalized or normalized in ordered_paths:
+                continue
+            ordered_paths.append(normalized)
+        return tuple(ordered_paths[:4])
+
+    def _parse_generated_file_edit(
+        self,
+        response: str,
+        expected_path: str,
+        expected_change_type: str,
+        default_summary: str,
+    ) -> GeneratedFileEdit:
+        payload = self._parse_json_payload(response)
+        path = self._normalize_text(payload.get("path", ""))
+        change_type = self._normalize_text(payload.get("change_type", expected_change_type)).lower() or expected_change_type
+        summary = self._normalize_text(payload.get("summary", default_summary)) or default_summary
+        if path != expected_path:
+            raise ValueError("generated edit path mismatch")
+        if change_type != expected_change_type:
+            raise ValueError("generated edit change_type mismatch")
+        if change_type not in {"update", "create"}:
+            raise ValueError("generated edit must be update or create")
+        content = payload.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("generated edit missing content")
+        if not content.endswith("\n"):
+            content += "\n"
+        return GeneratedFileEdit(
+            path=path,
+            change_type=change_type,
+            summary=summary,
+            content=content,
         )
 
     def _inspect_repo(self, session: Session) -> str:
@@ -724,14 +859,113 @@ class Runner:
         summary = self._build_proposal(session, task_text, repo_ops, constraints, handler)
         return summary, summary
 
+    def _generate_generic_file_edit(
+        self,
+        session: Session,
+        repo_ops: RepoOps,
+        edit: ProposalEditCandidate,
+        failure_summary: str | None = None,
+    ) -> GeneratedFileEdit | None:
+        if edit.change_type not in {"update", "create"}:
+            raise ValueError(f"unsupported generic change_type: {edit.change_type}")
+
+        try:
+            current_content = repo_ops.read_text(edit.path)
+        except OSError:
+            current_content = ""
+
+        prompt = build_edit_prompt(
+            session.request.user_text,
+            session.clarify_summary or "",
+            session.plan_summary or "",
+            session.proposal_summary or "",
+            session.proposal_candidate.validation_command if session.proposal_candidate and session.proposal_candidate.validation_command else DEFAULT_VALIDATION_COMMAND,
+            edit.path,
+            edit.change_type,
+            list(edit.target_symbols),
+            edit.intent,
+            self._context_summary_text(session.context_summaries, edit.path),
+            self._truncate_for_prompt(current_content, max_lines=220, max_chars=12000),
+            [(path, snippet) for path, snippet in self._prompt_file_snippets(repo_ops, session.retrieved_files) if path != edit.path],
+            failure_summary=failure_summary,
+            external_research=self._prompt_research_sources(session.research_sources),
+        )
+        generated = self._complete_structured_or_fallback(
+            prompt,
+            f"{SYSTEM_PROMPT}\n{EDIT_PROMPT}",
+            fallback=None,
+            parser=lambda response: self._parse_generated_file_edit(response, edit.path, edit.change_type, edit.intent or f"update {edit.path}"),
+            session=session,
+            step_type="edit",
+        )
+        if isinstance(generated, GeneratedFileEdit):
+            return generated
+        return None
+
+    def _apply_generic_candidate_changes(
+        self,
+        session: Session,
+        repo_ops: RepoOps,
+        empty_message: str,
+        success_prefix: str,
+        unchanged_message: str,
+        invalid_message: str,
+        failure_summary: str | None = None,
+    ) -> str:
+        candidate = session.proposal_candidate
+        if candidate is None or not candidate.edits:
+            return empty_message
+
+        generated_edits: list[GeneratedFileEdit] = []
+        for edit in candidate.edits:
+            generated = self._generate_generic_file_edit(session, repo_ops, edit, failure_summary=failure_summary)
+            if generated is None:
+                return invalid_message
+            generated_edits.append(generated)
+
+        changed_paths: list[str] = []
+        for generated in generated_edits:
+            change = repo_ops.apply_text_change(
+                generated.path,
+                generated.content or "",
+                generated.summary,
+            )
+            if change is None:
+                continue
+            session.changed_files.append(change)
+            self.store.save_summary(session)
+            self._emit(
+                session.session_id,
+                "file_changed",
+                {
+                    "path": change.path,
+                    "summary": change.summary,
+                    "change_type": change.change_type,
+                },
+            )
+            changed_paths.append(change.path)
+
+        if changed_paths:
+            return f"{success_prefix}: {', '.join(changed_paths)}."
+        return unchanged_message
+
     def _edit_repo(self, session: Session, repo_ops: RepoOps, handler: TaskHandler | None) -> str:
-        return self._apply_handler_changes(
+        if handler is not None:
+            return self._apply_handler_changes(
+                session,
+                repo_ops,
+                handler,
+                empty_message="No supported automated edit strategy matched the current repo and task.",
+                success_prefix="Applied preset task changes",
+                unchanged_message="Repository already matches the selected preset task; no file edits were needed.",
+            )
+        return self._apply_generic_candidate_changes(
             session,
             repo_ops,
-            handler,
-            empty_message="No supported automated edit strategy matched the current repo and task.",
-            success_prefix="Applied preset task changes",
-            unchanged_message="Repository already matches the selected preset task; no file edits were needed.",
+            empty_message="No bounded generic edit candidate was available for the current task.",
+            success_prefix="Applied model-backed bounded changes",
+            unchanged_message="Model-backed bounded edits matched the current repo snapshot; no file changes were needed.",
+            invalid_message="Model-backed edit generation did not yield a valid bounded change set.",
         )
 
     def _edit_repo_tool(
@@ -750,14 +984,23 @@ class Runner:
         handler: TaskHandler | None,
         failure_summary: str,
     ) -> str:
-        _ = failure_summary
-        return self._apply_handler_changes(
+        if handler is not None:
+            return self._apply_handler_changes(
+                session,
+                repo_ops,
+                handler,
+                empty_message="No supported automated fix strategy matched the current repo and task.",
+                success_prefix="Applied one repair pass",
+                unchanged_message="No additional fix was needed because the repo already matches the selected preset task.",
+            )
+        return self._apply_generic_candidate_changes(
             session,
             repo_ops,
-            handler,
-            empty_message="No supported automated fix strategy matched the current repo and task.",
+            empty_message="No bounded repair candidate was available for the current task.",
             success_prefix="Applied one repair pass",
-            unchanged_message="No additional fix was needed because the repo already matches the selected preset task.",
+            unchanged_message="No additional repair changes were needed after the latest test failure.",
+            invalid_message="Model-backed repair generation did not yield a valid bounded change set.",
+            failure_summary=failure_summary,
         )
 
     def _fix_repo_tool(
@@ -773,6 +1016,7 @@ class Runner:
     def _review_tool(self, session: Session, tests_ok: bool, handler: TaskHandler | None) -> tuple[str, str]:
         summary = self._review(session, tests_ok, handler)
         return summary, summary
+
     def _apply_handler_changes(
         self,
         session: Session,
@@ -825,10 +1069,10 @@ class Runner:
         summary = f"Ran {' '.join(command)} with exit={result.exit_code} in {result.duration_ms} ms."
         return result, summary
 
-    def _planned_targets(self, handler: TaskHandler | None) -> tuple[str, ...]:
-        if handler is None:
-            return ()
-        return tuple(change.path for change in handler.planned_changes)
+    def _planned_targets(self, session: Session, handler: TaskHandler | None) -> tuple[str, ...]:
+        if handler is not None:
+            return tuple(change.path for change in handler.planned_changes)
+        return self._generic_target_paths(session)
 
     def _execute_tool(
         self,
@@ -985,6 +1229,10 @@ class Runner:
         if proposal_summary:
             evidence_parts.append(proposal_summary)
 
+        research_summary = self._research_review_summary(session)
+        if research_summary:
+            evidence_parts.append(research_summary)
+
         retrieval_summary = self._retrieval_review_summary(session)
         if retrieval_summary:
             evidence_parts.append(retrieval_summary)
@@ -1054,6 +1302,18 @@ class Runner:
             return "Proposal candidate: " + " ".join(session.proposal_summary.strip().split())
         return "Proposal candidate: " + " ".join(candidate.summary().strip().split())
 
+    def _research_review_summary(self, session: Session) -> str:
+        if not session.research_enabled:
+            return ""
+        if not session.research_sources:
+            if session.research_summary:
+                return f"External research: {session.research_summary}"
+            return "External research: enabled but no external sources were captured."
+        parts = [f"{source.title} ({source.url})" for source in session.research_sources[:3]]
+        if session.research_summary and session.research_summary.startswith("External research returned no sources"):
+            return f"External research: {session.research_summary}"
+        return "External research: used " + ", ".join(parts) + "."
+
     def _retrieval_review_summary(self, session: Session) -> str:
         if not session.retrieved_files:
             return "Grounding: no repo-aware retrieval context was selected."
@@ -1110,15 +1370,6 @@ class Runner:
         return f"LLM note: {step_text} used deterministic fallback because {', '.join(reason_texts)}."
 
     def _assess_proposal(self, session: Session, handler: TaskHandler | None) -> ProposalAssessment:
-        if handler is None:
-            return ProposalAssessment(
-                status="unavailable",
-                score=0,
-                has_validation_command=False,
-                used_fallback=self._proposal_fallback_used(session),
-                note="no preset handler matched the current task",
-            )
-
         candidate = session.proposal_candidate
         if candidate is None:
             return ProposalAssessment(
@@ -1134,11 +1385,13 @@ class Runner:
         for edit in candidate.edits:
             if edit.path not in candidate_targets:
                 candidate_targets.append(edit.path)
-        has_validation_command = candidate.validation_command == handler.validation_command
+        expected_validation_command = handler.validation_command if handler else DEFAULT_VALIDATION_COMMAND
+        has_validation_command = candidate.validation_command == expected_validation_command
         used_fallback = self._proposal_fallback_used(session)
 
         if not changed_targets:
             score = 70 if has_validation_command else 50
+            note = "repository already matched the preset task before editing" if handler else "no generic file edits were applied on the current repo snapshot"
             return ProposalAssessment(
                 status="not_needed",
                 score=score,
@@ -1147,7 +1400,7 @@ class Runner:
                 extra_targets=list(candidate_targets),
                 has_validation_command=has_validation_command,
                 used_fallback=used_fallback,
-                note="repository already matched the preset task before editing",
+                note=note,
             )
 
         matched_targets = [path for path in changed_targets if path in candidate_targets]
@@ -1205,4 +1458,30 @@ class Runner:
                 return "Run completed successfully. The edit loop applied real file changes and tests passed."
             return "Run completed successfully without needing file changes; tests passed."
         return "Run completed with failing tests after the allowed auto-fix attempts."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

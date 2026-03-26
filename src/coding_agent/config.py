@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+DEFAULT_WEB_RESEARCH_API_BASE = "https://html.duckduckgo.com/html/"
+DEFAULT_WEB_RESEARCH_USER_AGENT = "coding-agent-demo/0.1 (+https://local)"
+
+
 def _resolve_path(base_dir: Path, raw_value: str | None, default_value: str) -> Path:
     candidate = Path(raw_value) if raw_value else Path(default_value)
     if not candidate.is_absolute():
@@ -44,6 +48,10 @@ class AppConfig:
     qwen_timeout_seconds: float
     qwen_max_retries: int
     qwen_retry_backoff_seconds: float
+    web_research_api_base: str = DEFAULT_WEB_RESEARCH_API_BASE
+    web_research_timeout_seconds: float = 20.0
+    web_research_max_results: int = 5
+    web_research_user_agent: str = DEFAULT_WEB_RESEARCH_USER_AGENT
 
     def ensure_directories(self) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +76,10 @@ def load_config(base_dir: Path | None = None) -> AppConfig:
         qwen_timeout_seconds=max(1.0, _env_float("CODING_AGENT_QWEN_TIMEOUT_SECONDS", 45.0)),
         qwen_max_retries=max(0, _env_int("CODING_AGENT_QWEN_MAX_RETRIES", 2)),
         qwen_retry_backoff_seconds=max(0.0, _env_float("CODING_AGENT_QWEN_RETRY_BACKOFF_SECONDS", 1.0)),
+        web_research_api_base=os.getenv("CODING_AGENT_WEB_RESEARCH_API_BASE", DEFAULT_WEB_RESEARCH_API_BASE),
+        web_research_timeout_seconds=max(1.0, _env_float("CODING_AGENT_WEB_RESEARCH_TIMEOUT_SECONDS", 20.0)),
+        web_research_max_results=max(1, _env_int("CODING_AGENT_WEB_RESEARCH_MAX_RESULTS", 5)),
+        web_research_user_agent=os.getenv("CODING_AGENT_WEB_RESEARCH_USER_AGENT", DEFAULT_WEB_RESEARCH_USER_AGENT),
     )
     config.ensure_directories()
     return config

@@ -1,5 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+from pathlib import Path
 import sys
 from typing import TextIO
 
@@ -51,15 +52,60 @@ def _list_text(value: object) -> str:
     return ", ".join(str(item) for item in value)
 
 
+
+def _repo_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    return Path(text).name or text
+
+
+
+def _compact_review_text(value: object) -> str:
+    text = _one_line(str(value or ""))
+    if not text:
+        return ""
+
+    markers = [
+        "Proposal assessment:",
+        "Grounding:",
+        "Read evidence:",
+        "Evidence:",
+        "Validation:",
+        "Audit:",
+        "LLM note:",
+        "Residual risk:",
+    ]
+    end = len(text)
+    for marker in markers:
+        index = text.find(marker)
+        if index != -1:
+            end = min(end, index)
+    if end != len(text):
+        return text[:end].rstrip(" .") + "."
+    return text
+
+
 class TerminalRenderer:
-    def __init__(self, stream: TextIO | None = None) -> None:
+    def __init__(
+        self,
+        stream: TextIO | None = None,
+        event_verbosity: str = "verbose",
+        summary_verbosity: str = "verbose",
+    ) -> None:
         self.stream = stream or sys.stdout
+        self.event_verbosity = event_verbosity
+        self.summary_verbosity = summary_verbosity
 
     def write(self, text: str = "") -> None:
         print(text, file=self.stream)
 
     def render_event(self, event: Event | dict[str, object]) -> None:
         payload_event = event.to_dict() if isinstance(event, Event) else event
+        if self.event_verbosity == "compact":
+            self._render_event_compact(payload_event)
+            return
+
         timestamp = _short_time(str(payload_event.get("timestamp", "")))
         kind = str(payload_event.get("kind", "unknown"))
         payload = payload_event.get("payload", {})
@@ -142,6 +188,130 @@ class TerminalRenderer:
             return
 
         self.write(f"[{timestamp}] {kind}: {payload}")
+
+    def _render_event_compact(self, payload_event: dict[str, object]) -> None:
+        timestamp = _short_time(str(payload_event.get("timestamp", "")))
+        kind = str(payload_event.get("kind", "unknown"))
+        payload = payload_event.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+
+        if kind == "session_started":
+            handler = str(payload.get("task_handler", "") or "generic")
+            self.write(
+                f"[{timestamp}] run started | handler={handler} | repo={_repo_name(payload.get('repo', ''))}"
+            )
+            return
+        if kind == "context_selected":
+            files = payload.get("files", [])
+            if isinstance(files, list) and files:
+                paths = [str(item.get("path", "")) for item in files if isinstance(item, dict) and item.get("path")]
+                self.write(f"[{timestamp}] grounding selected | {', '.join(paths)}")
+            else:
+                self.write(f"[{timestamp}] grounding selected | none")
+            return
+        if kind == "step_started":
+            step_type = str(payload.get("step_type", "") or "step")
+            if step_type != "test":
+                self.write(f"[{timestamp}] {step_type}...")
+            return
+        if kind == "step_completed":
+            step_type = str(payload.get("step_type", "") or "step")
+            if step_type == "test":
+                return
+            labels = {
+                "clarify": "clarify ready",
+                "plan": "plan ready",
+                "read": "read ready",
+                "proposal": "proposal ready",
+                "edit": "edit applied",
+                "fix": "fix applied",
+                "review": "review ready",
+            }
+            self.write(f"[{timestamp}] {labels.get(step_type, step_type + ' done')}")
+            return
+        if kind == "step_failed":
+            self.write(f"[{timestamp}] {payload.get('step_type', '')} failed | {payload.get('error_message', '')}")
+            return
+        if kind == "command_started":
+            command = _command_text(payload.get("command", []))
+            if command:
+                self.write(f"[{timestamp}] validation running | {command}")
+            return
+        if kind == "command_completed":
+            exit_code = str(payload.get("exit_code", ""))
+            duration_ms = payload.get("duration_ms", "")
+            status = "passed" if exit_code == "0" else f"failed (exit={exit_code})"
+            self.write(f"[{timestamp}] validation {status} | {duration_ms} ms")
+            return
+        if kind == "session_completed":
+            self.write(f"[{timestamp}] run completed | status={payload.get('status', '')}")
+            return
+
+    def render_run_summary(self, summary: dict[str, object]) -> None:
+        request = summary.get("request", {})
+        task = request.get("user_text", "") if isinstance(request, dict) else ""
+
+        self.write("Run Result")
+        self.write(f"Session: {summary.get('session_id', '')}")
+        self.write(f"Status: {summary.get('status', '')}")
+
+        task_handler = _one_line(str(summary.get("task_handler", "")))
+        if task_handler:
+            self.write(f"Handler: {task_handler}")
+        if task:
+            self.write(f"Task: {task}")
+
+        retrieved_files = summary.get("retrieved_files", [])
+        if isinstance(retrieved_files, list) and retrieved_files:
+            retrieved_paths = [
+                str(item.get("path", ""))
+                for item in retrieved_files
+                if isinstance(item, dict) and item.get("path")
+            ]
+            self.write("Grounding: " + ", ".join(retrieved_paths))
+
+        changed_files = summary.get("changed_files", [])
+        self.write("Changed files:")
+        if isinstance(changed_files, list) and changed_files:
+            for change in changed_files:
+                if not isinstance(change, dict):
+                    continue
+                self.write(f"  - {change.get('path', '')}: {change.get('summary', '')}")
+        else:
+            self.write("  - none")
+
+        test_results = summary.get("test_results", [])
+        if isinstance(test_results, list) and test_results:
+            latest = test_results[-1]
+            if isinstance(latest, dict):
+                command_text = _command_text(latest.get("command", []))
+                if not command_text:
+                    command_text = str(latest.get("command", ""))
+                validation_status = "passed" if latest.get("exit_code", 1) == 0 else f"failed (exit={latest.get('exit_code', '')})"
+                self.write(
+                    "Validation: "
+                    f"{validation_status} | {command_text} | {latest.get('duration_ms', '')} ms"
+                )
+
+        review_text = _compact_review_text(summary.get("review_summary", ""))
+        if not review_text:
+            review_text = _one_line(str(summary.get("final_summary", "")))
+        if review_text:
+            self.write(f"Review: {review_text}")
+
+        fallback_steps = summary.get("fallback_steps", [])
+        if isinstance(fallback_steps, list) and fallback_steps:
+            self.write("Model note: fallback used in " + ", ".join(str(item) for item in fallback_steps))
+        else:
+            self.write("Model note: model-backed clarify/plan/proposal without recorded fallback.")
+
+        session_id = str(summary.get("session_id", "") or "")
+        if session_id:
+            self.write("Next commands:")
+            self.write(f"  - python -m coding_agent show {session_id}")
+            self.write(f"  - python -m coding_agent replay {session_id}")
+            self.write("  - python -m coding_agent report --session-limit 5 --open")
 
     def render_session_summary(self, summary: dict[str, object]) -> None:
         request = summary.get("request", {})

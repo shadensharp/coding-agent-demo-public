@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 
@@ -81,6 +81,20 @@ class RetrievedFile:
             "path": self.path,
             "score": self.score,
             "reasons": list(self.reasons),
+        }
+
+
+@dataclass(slots=True)
+class ResearchSource:
+    title: str
+    url: str
+    snippet: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "title": self.title,
+            "url": self.url,
+            "snippet": self.snippet,
         }
 
 
@@ -324,6 +338,10 @@ class Session:
     started_at: str | None = None
     finished_at: str | None = None
     task_handler: str | None = None
+    research_enabled: bool = False
+    research_query: str | None = None
+    research_summary: str | None = None
+    research_sources: list[ResearchSource] = field(default_factory=list)
     clarify_artifact: ClarifyArtifact | None = None
     clarify_summary: str | None = None
     plan_artifact: PlanArtifact | None = None
@@ -351,6 +369,10 @@ class Session:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "task_handler": self.task_handler,
+            "research_enabled": self.research_enabled,
+            "research_query": self.research_query,
+            "research_summary": self.research_summary,
+            "research_sources": [item.to_dict() for item in self.research_sources],
             "clarify_artifact": self.clarify_artifact.to_dict() if self.clarify_artifact else None,
             "clarify_summary": self.clarify_summary,
             "plan_artifact": self.plan_artifact.to_dict() if self.plan_artifact else None,

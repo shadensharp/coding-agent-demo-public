@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import io
 import json
@@ -27,8 +27,9 @@ from coding_agent.render import TerminalRenderer
 from coding_agent.repo_ops import RepoOps
 from coding_agent.runner import Runner
 from coding_agent.storage import JsonlRunStore
+from coding_agent.models import ResearchSource
 from coding_agent.task_handlers import DEFAULT_VALIDATION_COMMAND
-from coding_agent.workflow import EDIT_PROPOSAL_TOOL, PRESET_EDIT_TOOL, READ_REPO_TOOL, REVIEW_TOOL, TEST_COMMAND_TOOL
+from coding_agent.workflow import EDIT_PROPOSAL_TOOL, PRESET_EDIT_TOOL, READ_REPO_TOOL, RESEARCH_TOOL, REVIEW_TOOL, TEST_COMMAND_TOOL
 
 
 class FakeLlmClient:
@@ -47,6 +48,17 @@ class FakeLlmClient:
         if not self.responses:
             raise RuntimeError("No fake LLM responses left")
         return self.responses.pop(0)
+
+
+class FakeResearchClient:
+    def __init__(self, sources: list[ResearchSource]) -> None:
+        self.sources = list(sources)
+        self.queries: list[str] = []
+
+    def search(self, query: str, max_results: int | None = None) -> list[ResearchSource]:
+        _ = max_results
+        self.queries.append(query)
+        return list(self.sources)
 
 
 class QwenClientTests(unittest.TestCase):
@@ -75,7 +87,7 @@ class QwenClientTests(unittest.TestCase):
             sessions_dir=PROJECT_ROOT / "runtime" / "sessions",
             default_repo_dir=PROJECT_ROOT / "demo_repo",
             qwen_model="qwen-plus",
-            qwen_api_key="test-key",
+            qwen_api_key="sk-test",
             qwen_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             qwen_timeout_seconds=30.0,
             qwen_max_retries=2,
@@ -105,7 +117,7 @@ class QwenClientTests(unittest.TestCase):
             sessions_dir=PROJECT_ROOT / "runtime" / "sessions",
             default_repo_dir=PROJECT_ROOT / "demo_repo",
             qwen_model="qwen-plus",
-            qwen_api_key="test-key",
+            qwen_api_key="sk-test",
             qwen_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
             qwen_timeout_seconds=30.0,
             qwen_max_retries=3,
@@ -244,6 +256,40 @@ class RendererTests(unittest.TestCase):
         self.assertIn("+_PRIORITY_ORDER", rendered)
         self.assertIn("Latest test: exit=0", rendered)
 
+    def test_run_summary_renders_compact_user_facing_result(self) -> None:
+        stream = io.StringIO()
+        renderer = TerminalRenderer(stream, event_verbosity="compact", summary_verbosity="compact")
+        renderer.render_run_summary(
+            {
+                "session_id": "sess_test",
+                "status": "completed",
+                "task_handler": "todo_priority_patch",
+                "request": {"user_text": "demo task"},
+                "retrieved_files": [
+                    {"path": "todo_api.py"},
+                    {"path": "tests/test_todo_api.py"},
+                ],
+                "changed_files": [
+                    {"path": "todo_api.py", "summary": "Updated behavior."},
+                ],
+                "test_results": [
+                    {
+                        "command": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+                        "exit_code": 0,
+                        "duration_ms": 50,
+                    }
+                ],
+                "review_summary": "Behavior change: list_todos now sorts by priority. Proposal assessment: accepted score=100.",
+                "fallback_steps": [],
+            }
+        )
+        rendered = stream.getvalue()
+        self.assertIn("Run Result", rendered)
+        self.assertIn("Handler: todo_priority_patch", rendered)
+        self.assertIn("Grounding: todo_api.py, tests/test_todo_api.py", rendered)
+        self.assertIn("Validation: passed | python -m unittest discover -s tests -q | 50 ms", rendered)
+        self.assertIn("Review: Behavior change: list_todos now sorts by priority.", rendered)
+        self.assertIn("python -m coding_agent report --session-limit 5 --open", rendered)
     def test_eval_summary_renders_case_lines_and_metrics(self) -> None:
         stream = io.StringIO()
         renderer = TerminalRenderer(stream)
@@ -317,8 +363,16 @@ class RunnerIntegrationTests(unittest.TestCase):
         (self.repo_dir / "README.md").write_text("# Demo Repo\n", encoding="utf-8")
         (self.repo_dir / "todo_api.py").write_text(BASELINE_TODO_API, encoding="utf-8")
         (self.repo_dir / "todo_queries.py").write_text(BASELINE_TODO_QUERIES, encoding="utf-8")
+        (self.repo_dir / "math_utils.py").write_text(
+            "from __future__ import annotations\n\n\ndef add(a: int, b: int) -> int:\n    return a + b\n\n\ndef subtract(a: int, b: int) -> int:\n    return a + b\n",
+            encoding="utf-8",
+        )
         (self.repo_dir / "tests" / "test_todo_api.py").write_text(BASELINE_TEST_TODO_API, encoding="utf-8")
         (self.repo_dir / "tests" / "test_todo_queries.py").write_text(BASELINE_TEST_TODO_QUERIES, encoding="utf-8")
+        (self.repo_dir / "tests" / "test_math_utils.py").write_text(
+            "from __future__ import annotations\n\nimport unittest\n\nfrom math_utils import add\n\n\nclass MathUtilsTests(unittest.TestCase):\n    def test_add(self) -> None:\n        self.assertEqual(add(2, 3), 5)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+            encoding="utf-8",
+        )
 
         runtime_dir = self.temp_dir / "runtime"
         self.config = AppConfig(
@@ -473,6 +527,195 @@ class RunnerIntegrationTests(unittest.TestCase):
         todo_queries_text = (self.repo_dir / "todo_queries.py").read_text(encoding="utf-8")
         self.assertIn("query.strip().casefold()", todo_queries_text)
         self.assertIn("completed is None", todo_queries_text)
+
+    def test_runner_generic_mode_can_edit_arbitrary_python_repo_files_with_model_output(self) -> None:
+        fake_llm = FakeLlmClient(
+            [
+                json.dumps(
+                    {
+                        "implementation_target": "Update math_utils.py and tests/test_math_utils.py to correct subtract behavior and add regression coverage.",
+                        "relevant_files": ["math_utils.py", "tests/test_math_utils.py"],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "steps": [
+                            "Inspect math_utils.py and tests/test_math_utils.py.",
+                            "Update subtract in math_utils.py.",
+                            "Add regression coverage in tests/test_math_utils.py.",
+                            f"Run {DEFAULT_VALIDATION_COMMAND}.",
+                        ],
+                        "target_files": ["math_utils.py", "tests/test_math_utils.py"],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "summary": "Prepare bounded edits for math_utils.py and tests/test_math_utils.py.",
+                        "edits": [
+                            {
+                                "path": "math_utils.py",
+                                "change_type": "update",
+                                "target_symbols": ["subtract"],
+                                "intent": "correct subtract so it performs subtraction instead of addition",
+                            },
+                            {
+                                "path": "tests/test_math_utils.py",
+                                "change_type": "update",
+                                "target_symbols": ["MathUtilsTests.test_subtract"],
+                                "intent": "add regression coverage for subtract",
+                            },
+                        ],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "path": "math_utils.py",
+                        "change_type": "update",
+                        "summary": "Correct subtract to use subtraction.",
+                        "content": "from __future__ import annotations\n\n\ndef add(a: int, b: int) -> int:\n    return a + b\n\n\ndef subtract(a: int, b: int) -> int:\n    return a - b\n",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "path": "tests/test_math_utils.py",
+                        "change_type": "update",
+                        "summary": "Add regression coverage for subtract.",
+                        "content": "from __future__ import annotations\n\nimport unittest\n\nfrom math_utils import add, subtract\n\n\nclass MathUtilsTests(unittest.TestCase):\n    def test_add(self) -> None:\n        self.assertEqual(add(2, 3), 5)\n\n    def test_subtract(self) -> None:\n        self.assertEqual(subtract(5, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+                    }
+                ),
+            ]
+        )
+        runner = Runner(config=self.config, store=self.store, renderer=self.renderer, llm_client=fake_llm)
+
+        session = runner.run(
+            task_text="Fix subtract in math_utils.py and add regression coverage in the math utils tests",
+            repo_path=str(self.repo_dir),
+        )
+
+        self.assertEqual(session.status, "completed")
+        self.assertIsNone(session.task_handler)
+        self.assertEqual(session.fallback_steps, [])
+        self.assertEqual({edit.path for edit in session.proposal_candidate.edits}, {"math_utils.py", "tests/test_math_utils.py"})
+        self.assertEqual(session.proposal_assessment.status, "accepted")
+        self.assertEqual(session.proposal_assessment.score, 100)
+        self.assertFalse(session.proposal_assessment.used_fallback)
+        self.assertEqual({change.path for change in session.changed_files}, {"math_utils.py", "tests/test_math_utils.py"})
+        self.assertEqual(session.test_results[-1].exit_code, 0)
+        self.assertIn("math_utils.py", session.review_summary or "")
+        self.assertIn("Proposal assessment: accepted score=100 source=model", session.review_summary or "")
+        self.assertIn("Target file:", fake_llm.prompts[3])
+        self.assertIn("math_utils.py", fake_llm.prompts[3])
+
+        math_utils_text = (self.repo_dir / "math_utils.py").read_text(encoding="utf-8")
+        self.assertIn("return a - b", math_utils_text)
+        test_math_utils_text = (self.repo_dir / "tests" / "test_math_utils.py").read_text(encoding="utf-8")
+        self.assertIn("test_subtract", test_math_utils_text)
+        self.assertIn("subtract(5, 3)", test_math_utils_text)
+
+    def test_runner_generic_mode_can_include_external_research_in_prompts_and_review(self) -> None:
+        fake_llm = FakeLlmClient(
+            [
+                json.dumps(
+                    {
+                        "implementation_target": "Update math_utils.py and tests/test_math_utils.py to correct subtract behavior and add regression coverage.",
+                        "relevant_files": ["math_utils.py", "tests/test_math_utils.py"],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "steps": [
+                            "Inspect math_utils.py and tests/test_math_utils.py.",
+                            "Update subtract in math_utils.py.",
+                            "Add regression coverage in tests/test_math_utils.py.",
+                            f"Run {DEFAULT_VALIDATION_COMMAND}.",
+                        ],
+                        "target_files": ["math_utils.py", "tests/test_math_utils.py"],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "summary": "Prepare bounded edits for math_utils.py and tests/test_math_utils.py.",
+                        "edits": [
+                            {
+                                "path": "math_utils.py",
+                                "change_type": "update",
+                                "target_symbols": ["subtract"],
+                                "intent": "correct subtract so it performs subtraction instead of addition",
+                            },
+                            {
+                                "path": "tests/test_math_utils.py",
+                                "change_type": "update",
+                                "target_symbols": ["MathUtilsTests.test_subtract"],
+                                "intent": "add regression coverage for subtract",
+                            },
+                        ],
+                        "validation_command": DEFAULT_VALIDATION_COMMAND,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "path": "math_utils.py",
+                        "change_type": "update",
+                        "summary": "Correct subtract to use subtraction.",
+                        "content": "from __future__ import annotations\n\n\ndef add(a: int, b: int) -> int:\n    return a + b\n\n\ndef subtract(a: int, b: int) -> int:\n    return a - b\n",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "path": "tests/test_math_utils.py",
+                        "change_type": "update",
+                        "summary": "Add regression coverage for subtract.",
+                        "content": "from __future__ import annotations\n\nimport unittest\n\nfrom math_utils import add, subtract\n\n\nclass MathUtilsTests(unittest.TestCase):\n    def test_add(self) -> None:\n        self.assertEqual(add(2, 3), 5)\n\n    def test_subtract(self) -> None:\n        self.assertEqual(subtract(5, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+                    }
+                ),
+            ]
+        )
+        research_client = FakeResearchClient(
+            [
+                ResearchSource(
+                    title="Python docs",
+                    url="https://docs.python.org/3/library/functions.html#sorted",
+                    snippet="sorted accepts a key function for custom ordering.",
+                )
+            ]
+        )
+        runner = Runner(
+            config=self.config,
+            store=self.store,
+            renderer=self.renderer,
+            llm_client=fake_llm,
+            research_client=research_client,
+        )
+
+        session = runner.run(
+            task_text="Fix subtract in math_utils.py and add regression coverage in the math utils tests",
+            repo_path=str(self.repo_dir),
+            enable_web_research=True,
+            research_query="python sorted and arithmetic operator docs",
+        )
+
+        self.assertEqual(session.status, "completed")
+        self.assertTrue(session.research_enabled)
+        self.assertEqual(session.research_query, "python sorted and arithmetic operator docs")
+        self.assertEqual(research_client.queries, ["python sorted and arithmetic operator docs"])
+        self.assertEqual(len(session.research_sources), 1)
+        self.assertIn("Python docs", session.research_summary or "")
+        self.assertIn("External research:", session.review_summary or "")
+        self.assertIn("https://docs.python.org/3/library/functions.html#sorted", session.review_summary or "")
+        self.assertIn("External research:", fake_llm.prompts[0])
+        self.assertIn("Python docs", fake_llm.prompts[0])
+        self.assertEqual([call.tool_name for call in session.tool_calls][0], RESEARCH_TOOL)
+        self.assertEqual(len(session.approval_checks), 6)
+
+        summary = self.store.load_summary(session.session_id)
+        self.assertTrue(summary["research_enabled"])
+        self.assertEqual(summary["research_query"], "python sorted and arithmetic operator docs")
+        self.assertEqual(len(summary["research_sources"]), 1)
 
     def test_runner_uses_grounded_structured_model_outputs_when_schema_matches(self) -> None:
         fake_llm = FakeLlmClient(
@@ -648,4 +891,7 @@ class RunnerIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
 

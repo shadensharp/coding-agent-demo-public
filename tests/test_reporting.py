@@ -86,11 +86,24 @@ class DashboardReportTests(unittest.TestCase):
                 "user_text": "Add priority sorting to the Todo API and fix the PATCH partial update bug.",
             },
             "fallback_steps": list(fallback_steps),
-            "tool_calls": [{"tool_name": "repo_reader"}] * 5,
+            "tool_calls": [
+                {"step_type": "read", "tool_name": "repo_reader", "status": "completed", "approval_mode": "auto_allow"},
+                {"step_type": "proposal", "tool_name": "edit_proposal_generator", "status": "completed", "approval_mode": "auto_allow"},
+                {"step_type": "edit", "tool_name": "preset_file_editor", "status": "completed", "approval_mode": "auto_allow"},
+                {"step_type": "test", "tool_name": "python_test_runner", "status": "completed", "approval_mode": "auto_allow"},
+                {"step_type": "review", "tool_name": "review_compiler", "status": "completed", "approval_mode": "auto_allow"},
+            ],
             "approval_checks": [{"approved": True}] * 5,
-            "retrieved_files": [{"path": "todo_api.py"}, {"path": "tests/test_todo_api.py"}],
-            "changed_files": [{"path": "todo_api.py"}, {"path": "tests/test_todo_api.py"}],
-            "test_results": [{"duration_ms": duration_ms}],
+            "retrieved_files": [
+                {"path": "todo_api.py", "reasons": ["required file", "handler priority"]},
+                {"path": "tests/test_todo_api.py", "reasons": ["required file", "regression coverage file"]},
+            ],
+            "changed_files": [
+                {"path": "todo_api.py", "summary": "Implement priority-aware todo ordering.", "diff_excerpt": "+_PRIORITY_ORDER = {'high': 0}"},
+                {"path": "tests/test_todo_api.py", "summary": "Add regression coverage for PATCH field preservation.", "diff_excerpt": "+    def test_list_todos_sorts_by_priority_then_id(self) -> None:"},
+            ],
+            "test_results": [{"command": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"], "exit_code": 0, "duration_ms": duration_ms}],
+            "review_summary": "Behavior change: list_todos now sorts todos by priority and apply_patch_update preserves unspecified fields. Validation: python -m unittest discover -s tests -q passed in 110 ms.",
             "proposal_assessment": {
                 "status": proposal_status,
                 "score": proposal_score,
@@ -110,23 +123,26 @@ class DashboardReportTests(unittest.TestCase):
         self.assertEqual(report["session_metrics"]["avg_proposal_score"], 95.0)
         self.assertEqual(report["latest_model_session"]["session_id"], "sess_live")
         self.assertEqual(report["latest_session"]["session_id"], "sess_live")
+        self.assertEqual(report["latest_model_session_detail"]["session_id"], "sess_live")
         self.assertEqual(report["eval_summary"]["mode"], "offline")
         self.assertEqual(report["eval_summary"]["pass_rate"], 100.0)
 
         markdown = render_dashboard_markdown(report)
-        self.assertIn("# Coding Agent Demo Dashboard", markdown)
-        self.assertIn("## Latest Model-Backed Session", markdown)
+        self.assertIn("# Coding Agent Operator Report", markdown)
+        self.assertIn("## Latest Run Outcome", markdown)
+        self.assertIn("## Operator Commands", markdown)
         self.assertIn("sess_live", markdown)
         self.assertIn("proposal_accept_rate: 100.0%", markdown)
         self.assertIn("## Eval Snapshot", markdown)
-        self.assertIn("proposal_accept_rate: 100.0%", markdown)
         self.assertIn("## Recent Session Table", markdown)
         self.assertIn("live_smoke_schema_prompt_host", markdown)
         self.assertIn("## Eval Case Table", markdown)
 
         html = render_dashboard_html(report)
-        self.assertIn("<title>Coding Agent Demo Dashboard</title>", html)
-        self.assertIn("static report shell", html)
+        self.assertIn("<title>Coding Agent Operator Report</title>", html)
+        self.assertIn("operator report", html)
+        self.assertIn("Latest Run Narrative", html)
+        self.assertIn("Operator Commands", html)
         self.assertIn("live_smoke_schema_prompt_host", html)
         self.assertIn("Eval Cases", html)
 
@@ -141,22 +157,21 @@ class DashboardReportTests(unittest.TestCase):
         self.assertTrue(html_path.exists())
 
         markdown = markdown_path.read_text(encoding="utf-8")
-        self.assertIn("Recent Session Table", markdown)
+        self.assertIn("Latest Run Outcome", markdown)
         self.assertIn("sess_offline", markdown)
 
         html = html_path.read_text(encoding="utf-8")
-        self.assertIn("Coding Agent Demo Dashboard", html)
-        self.assertIn("Latest Session Snapshot", html)
+        self.assertIn("Coding Agent Run Console", html)
+        self.assertIn("Latest Run Narrative", html)
         self.assertIn("sess_offline", html)
 
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["session_metrics"]["total_sessions"], 2)
         self.assertEqual(payload["latest_model_session"]["session_id"], "sess_live")
+        self.assertEqual(payload["latest_model_session_detail"]["session_id"], "sess_live")
         self.assertEqual(payload["eval_summary"]["total_cases"], 2)
         self.assertTrue(payload["html_path"].endswith("dashboard.html"))
 
 
 if __name__ == "__main__":
     unittest.main()
-
-

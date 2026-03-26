@@ -13,6 +13,7 @@ EDIT_PROPOSAL_TOOL = "edit_proposal_generator"
 PRESET_EDIT_TOOL = "preset_file_editor"
 TEST_COMMAND_TOOL = "python_test_runner"
 REVIEW_TOOL = "review_compiler"
+RESEARCH_TOOL = "web_researcher"
 
 T = TypeVar("T")
 
@@ -29,7 +30,7 @@ class ToolRequest:
 
 class ApprovalPolicy:
     def evaluate(self, request: ToolRequest, handler: TaskHandler | None) -> ApprovalCheck:
-        if request.tool_name in {READ_REPO_TOOL, EDIT_PROPOSAL_TOOL, REVIEW_TOOL}:
+        if request.tool_name in {READ_REPO_TOOL, EDIT_PROPOSAL_TOOL, REVIEW_TOOL, RESEARCH_TOOL}:
             return ApprovalCheck(
                 tool_name=request.tool_name,
                 step_type=request.step_type,
@@ -48,30 +49,40 @@ class ApprovalPolicy:
                     step_type=request.step_type,
                     approved=True,
                     mode="auto_allow",
-                    reason="no-op write scope because no preset handler matched",
+                    reason="no-op write scope because no bounded edit targets were requested",
                     requested_targets=list(request.requested_targets),
                     requested_command=list(request.requested_command),
                 )
 
-            if handler is None:
+            if handler is not None:
+                allowed_targets = {change.path for change in handler.planned_changes}
+                if requested_targets.issubset(allowed_targets):
+                    return ApprovalCheck(
+                        tool_name=request.tool_name,
+                        step_type=request.step_type,
+                        approved=True,
+                        mode="auto_allow",
+                        reason=f"write scope constrained to preset handler '{handler.name}'",
+                        requested_targets=list(request.requested_targets),
+                        requested_command=list(request.requested_command),
+                    )
                 return ApprovalCheck(
                     tool_name=request.tool_name,
                     step_type=request.step_type,
                     approved=False,
                     mode="auto_deny",
-                    reason="write scope requested without a matched preset handler",
+                    reason="requested write scope exceeds the preset handler allowlist",
                     requested_targets=list(request.requested_targets),
                     requested_command=list(request.requested_command),
                 )
 
-            allowed_targets = {change.path for change in handler.planned_changes}
-            if requested_targets.issubset(allowed_targets):
+            if self._is_generic_python_scope(requested_targets):
                 return ApprovalCheck(
                     tool_name=request.tool_name,
                     step_type=request.step_type,
                     approved=True,
                     mode="auto_allow",
-                    reason=f"write scope constrained to preset handler '{handler.name}'",
+                    reason="write scope constrained to bounded Python files selected by clarify/plan/proposal",
                     requested_targets=list(request.requested_targets),
                     requested_command=list(request.requested_command),
                 )
@@ -81,7 +92,7 @@ class ApprovalPolicy:
                 step_type=request.step_type,
                 approved=False,
                 mode="auto_deny",
-                reason="requested write scope exceeds the preset handler allowlist",
+                reason="generic write scope must stay within a small Python-only target set",
                 requested_targets=list(request.requested_targets),
                 requested_command=list(request.requested_command),
             )
@@ -117,6 +128,19 @@ class ApprovalPolicy:
             requested_targets=list(request.requested_targets),
             requested_command=list(request.requested_command),
         )
+
+    def _is_generic_python_scope(self, requested_targets: set[str]) -> bool:
+        if not requested_targets or len(requested_targets) > 4:
+            return False
+        for target in requested_targets:
+            normalized = str(target).strip().replace("\\", "/")
+            if not normalized or normalized.startswith("/"):
+                return False
+            if ".." in normalized.split("/"):
+                return False
+            if not normalized.endswith(".py"):
+                return False
+        return True
 
 
 class ToolExecutor:

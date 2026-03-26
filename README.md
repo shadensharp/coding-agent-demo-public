@@ -1,112 +1,129 @@
-# Coding Agent Demo
+﻿# Coding Agent Demo
 
-这是一个本地可运行的 Python `coding agent` 演示项目。它使用命令行作为唯一入口，在固定的 `demo_repo` 中执行一条受控流程：
+A local coding-agent demo with a bounded engineering workflow, a compact CLI, and a small web operator surface.
 
-`clarify -> plan -> read -> proposal -> edit -> test -> review`
+The project is intentionally constrained:
+- single agent
+- Python repositories only
+- bounded write scope
+- explicit workflow approvals
+- persisted session summaries and event logs
 
-当前版本是一个有边界的演示实现，不是通用代码代理。它支持两类预设任务：
+The main execution loop is:
 
-- 为 Todo API 增加 `priority` 排序，并修复 `PATCH` 局部更新行为
-- 为 Todo 查询辅助函数增加完成态筛选和不区分大小写搜索
+`clarify -> plan -> read -> proposal -> edit -> test -> review -> report`
 
-## 目录结构
+This repo includes two preset demo tasks for the bundled `demo_repo`, and it also supports generic bounded edits for other local Python repositories when no preset handler matches.
+
+## What It Shows
+
+- repo-aware retrieval before planning and editing
+- proposal generation separate from real file edits
+- approval-scoped workflow tools for read, research, edit, test, and review
+- compact terminal output by default, with verbose audit available when needed
+- local web console for running tasks and inspecting sessions
+- optional external web research that is recorded as evidence but does not replace local grounding
+- persisted session artifacts under `runtime/sessions/<session_id>/`
+
+## Key User Surfaces
+
+CLI:
+- `python -m coding_agent run --task "..."`
+- `python -m coding_agent run --task "..." --repo "C:\path\to\repo"`
+- `python -m coding_agent run --task "..." --web-research --research-query "..."`
+- `python -m coding_agent report --session-limit 5 --open`
+- `python -m coding_agent serve --open`
+
+Compatibility wrapper:
+- `python run_agent.py ...`
+
+Web console:
+- start with `python -m coding_agent serve --open`
+- default URL is `http://127.0.0.1:8765/`
+- page shows current run status, step timeline, event timeline, changed files, and research evidence
+
+## Repository Layout
 
 ```text
 .
-├─ demo_repo/              # agent 操作的固定示例仓库
-├─ src/coding_agent/       # 核心实现
-├─ tests/                  # 项目测试
-├─ run_agent.py            # 无需安装即可运行的入口脚本
-├─ pyproject.toml
-└─ README.md
+|- demo_repo/               # bundled baseline repo used by preset demo tasks
+|- src/coding_agent/        # core implementation
+|- tests/                   # project test suite
+|- run_agent.py             # wrapper entrypoint for local execution
+|- pyproject.toml
+`- README.md
 ```
 
-## 运行环境
+## Requirements
 
 - Python `3.11+`
-- Windows、macOS、Linux 均可，只要本机可执行 `python`
-- 默认无第三方运行时依赖
-- 如需真实模型调用，需自行配置 `QWEN_API_KEY`
+- no mandatory third-party runtime dependency for the offline path
+- `QWEN_API_KEY` only if you want live model-backed execution
 
-## 快速开始
+## Quick Start
 
-建议先创建虚拟环境，但这个项目不安装也能直接运行：
-
-```bash
-python -m venv .venv
-```
-
-Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m unittest discover -s tests -q
-python run_agent.py eval
-```
-
-macOS / Linux:
+Run the tests:
 
 ```bash
-source .venv/bin/activate
 python -m unittest discover -s tests -q
-python run_agent.py eval
 ```
 
-## 常用命令
-
-重置示例仓库到基线状态：
+Reset the bundled demo repo to the seeded baseline:
 
 ```bash
 python run_agent.py reset-demo
 ```
 
-执行一次任务：
+Run the preset Todo API task:
 
 ```bash
 python run_agent.py run --task "Add priority sorting to the Todo API and fix the PATCH partial update bug."
 ```
 
-离线评测所有预设任务：
+Open the local operator surface:
 
 ```bash
-python run_agent.py eval
+python run_agent.py serve --open
 ```
 
-生成静态报告：
+Generate and open the static dashboard:
 
 ```bash
-python run_agent.py report --session-limit 5
+python run_agent.py report --session-limit 5 --open
 ```
 
-查看最近会话：
+## Optional Environment Variables
 
-```bash
-python run_agent.py list --limit 10
-```
+- `QWEN_API_KEY`: enable live Qwen calls
+- `CODING_AGENT_MODEL`: defaults to `qwen-plus`
+- `QWEN_API_BASE`: defaults to `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- `CODING_AGENT_RUNTIME_DIR`: defaults to `runtime`
+- `CODING_AGENT_DEMO_REPO`: defaults to `demo_repo`
+- `CODING_AGENT_QWEN_TIMEOUT_SECONDS`: defaults to `45`
+- `CODING_AGENT_QWEN_MAX_RETRIES`: defaults to `2`
+- `CODING_AGENT_QWEN_RETRY_BACKOFF_SECONDS`: defaults to `1`
+- `CODING_AGENT_WEB_RESEARCH_API_BASE`: external research endpoint
+- `CODING_AGENT_WEB_RESEARCH_TIMEOUT_SECONDS`: external research timeout
+- `CODING_AGENT_WEB_RESEARCH_MAX_RESULTS`: external research result cap
+- `CODING_AGENT_WEB_RESEARCH_USER_AGENT`: external research user agent
 
-查看单次会话摘要：
+## Runtime Artifacts
 
-```bash
-python run_agent.py show <session_id>
-```
+Each run writes persisted artifacts under `runtime/sessions/<session_id>/`:
+- `summary.json`
+- `events.jsonl`
 
-## 可选环境变量
+`events.jsonl` is the real-time event stream used by the web console to show:
+- active run status
+- current step
+- latest event message
+- step timeline
+- event timeline
 
-- `QWEN_API_KEY`: 启用真实 Qwen 调用
-- `CODING_AGENT_MODEL`: 模型名，默认 `qwen-plus`
-- `QWEN_API_BASE`: 接口地址，默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- `CODING_AGENT_RUNTIME_DIR`: 运行产物目录，默认 `runtime`
-- `CODING_AGENT_DEMO_REPO`: 示例仓库路径，默认 `demo_repo`
-- `CODING_AGENT_QWEN_TIMEOUT_SECONDS`: 请求超时秒数，默认 `45`
-- `CODING_AGENT_QWEN_MAX_RETRIES`: 重试次数，默认 `2`
-- `CODING_AGENT_QWEN_RETRY_BACKOFF_SECONDS`: 指数退避初始秒数，默认 `1`
+## Positioning
 
+This is a bounded local coding-agent demo with an operator surface. It is intentionally not an unrestricted general-purpose autonomous coding product.
 
-说明：
+## Note
 
-- 未设置 `QWEN_API_KEY` 时，`clarify / plan / proposal` 会自动回退到离线逻辑
-- `eval` 默认使用离线模式，不会主动调用真实模型
-- 运行过程中会在 `runtime/` 下生成会话记录和报告文件
-- 如果需要安装成系统命令，再执行 `python -m pip install -e .` 即可
-
-这是我第一次上传代码，我想这是一个值得纪念的时刻，看看我们能在ai时代都留下些什么，共勉
+这是我第一次上传代码，我想这是一个值得纪念的时刻，看看我们能在 AI 时代都留下些什么，共勉。
